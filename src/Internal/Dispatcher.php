@@ -399,6 +399,10 @@ final class Dispatcher
             $parts[] = '"errors":['.implode(',', array_map(static fn (Entry $e): string => $e->json, $entries)).']';
         }
 
+        // Who sent the request. The server files the client report under it, and without it every
+        // count this SDK reports lands under an empty library name.
+        $parts[] = '"context":'.json_encode(['$lib' => Version::LIB, '$lib_version' => Version::VERSION], \JSON_THROW_ON_ERROR | \JSON_UNESCAPED_SLASHES);
+
         $taken = null;
         if ($withReport) {
             $report = $this->reports->snapshot();

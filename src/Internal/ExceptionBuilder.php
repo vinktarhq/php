@@ -96,7 +96,9 @@ final class ExceptionBuilder
             return false;
         }
         $path = str_replace('\\', '/', $file);
-        if (str_contains($path, '/vendor/')) {
+        // The SDK's own frames (withScope, the scope store) are never the application's, wherever the
+        // package is: in vendor/, a path repository, or a checkout of this repository.
+        if (str_contains($path, '/vendor/') || str_starts_with($path, str_replace('\\', '/', \dirname(__DIR__)).'/')) {
             return false;
         }
         $root = str_replace('\\', '/', $this->projectRoot);
