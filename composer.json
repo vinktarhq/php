@@ -1,0 +1,55 @@
+{
+    "name": "vinktarhq/php",
+    "description": "Vinktar for PHP: product analytics and error tracking with request-scoped identity.",
+    "type": "library",
+    "license": "MIT",
+    "keywords": [
+        "vinktar",
+        "analytics",
+        "error-tracking",
+        "monitoring",
+        "php"
+    ],
+    "homepage": "https://vinktar.com",
+    "authors": [
+        {
+            "name": "john.vink"
+        }
+    ],
+    "support": {
+        "issues": "https://github.com/vinktarhq/php/issues",
+        "source": "https://github.com/vinktarhq/php"
+    },
+    "require": {
+        "php": ">=8.2",
+        "ext-curl": "*",
+        "ext-json": "*"
+    },
+    "require-dev": {
+        "friendsofphp/php-cs-fixer": "^3.64",
+        "phpstan/phpstan": "^2.1",
+        "phpunit/phpunit": "^11.5"
+    },
+    "suggest": {
+        "ext-zlib": "Compresses request bodies with gzip."
+    },
+    "autoload": {
+        "psr-4": {
+            "Vinktar\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Vinktar\\Tests\\": "tests/"
+        }
+    },
+    "config": {
+        "sort-packages": true
+    },
+    "scripts": {
+        "test": "phpunit",
+        "analyse": "phpstan analyse --memory-limit=1G",
+        "format": "php-cs-fixer fix",
+        "format:check": "php-cs-fixer fix --dry-run --diff"
+    }
+}
