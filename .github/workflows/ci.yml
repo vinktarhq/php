@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push: { branches: [main] }
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # The suite on every PHP the package promises, and once against the lowest versions of the dev
+  # tools composer.json allows, so a constraint that is too loose fails here rather than for a
+  # contributor.
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['8.2', '8.3', '8.4', '8.5']
+        dependencies: [highest]
+        include:
+          - php: '8.2'
+            dependencies: lowest
+    name: test (php ${{ matrix.php }}, ${{ matrix.dependencies }})
+    steps:
+      - uses: actions/checkout@v5
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: curl, json, zlib
+          coverage: none
+      - run: composer validate --strict
+      - run: composer update --no-interaction --no-progress --prefer-stable ${{ matrix.dependencies == 'lowest' && '--prefer-lowest' || '' }}
+      - run: vendor/bin/phpunit
+
+  static:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    name: phpstan and code style
+    steps:
+      - uses: actions/checkout@v5
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          coverage: none
+      - run: composer update --no-interaction --no-progress --prefer-stable
+      - run: vendor/bin/phpstan analyse --no-progress --memory-limit=1G
+      - run: vendor/bin/php-cs-fixer fix --dry-run --diff
+
+  # The package as Composer INSTALLS it, not as a source tree: the release archive honours
+  # .gitattributes, so a file the library needs that is marked export-ignore only shows up here.
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    name: archive
+    steps:
+      - uses: actions/checkout@v5
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          coverage: none
+      - name: install the archive somewhere else and use it
+        run: |
+          set -e
+          mkdir -p /tmp/archive /tmp/consumer
+          git archive HEAD | tar -x -C /tmp/archive
+          for path in tests spec .github phpunit.xml.dist; do
+            if [ -e "/tmp/archive/$path" ]; then echo "$path is in the release archive" >&2; exit 1; fi
+          done
+          cd /tmp/consumer
+          cat > composer.json <<'JSON'
+          {
+            "repositories": [{ "type": "path", "url": "/tmp/archive", "options": { "symlink": false, "versions": { "vinktarhq/php": "0.1.0" } } }],
+            "require": { "vinktarhq/php": "0.1.0" }
+          }
+          JSON
+          composer install --no-interaction --no-progress
+          php -r 'require "vendor/autoload.php"; exit(Vinktar\Version::LIB === "vinktar-php" ? 0 : 1);'

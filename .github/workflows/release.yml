@@ -1,0 +1,38 @@
+name: Release
+
+# Packagist publishes from the tag itself: its GitHub hook sees the release and reads the version
+# from the tag name. So there is nothing to upload here, and the one thing that can still go wrong
+# is a tag that disagrees with the version the package reports about itself on the wire. This
+# workflow fails loudly when it does, before anyone installs it.
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          coverage: none
+      - name: the tag, the constant and the release type agree
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+          PRERELEASE: ${{ github.event.release.prerelease }}
+        run: |
+          set -e
+          constant=$(php -r 'require "src/Version.php"; echo Vinktar\Version::VERSION;')
+          if [ "v$constant" != "$TAG" ]; then
+            echo "release tag $TAG does not match Version::VERSION $constant" >&2
+            exit 1
+          fi
+          case "$constant" in
+            *-*) [ "$PRERELEASE" = "true" ] || { echo "$constant is a prerelease; mark the GitHub release as one" >&2; exit 1; } ;;
+            *) [ "$PRERELEASE" = "false" ] || { echo "$constant is not a prerelease version" >&2; exit 1; } ;;
+          esac
