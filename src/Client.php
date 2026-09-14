@@ -10,6 +10,7 @@ use Vinktar\Internal\Clock;
 use Vinktar\Internal\Dedupe;
 use Vinktar\Internal\Dispatcher;
 use Vinktar\Internal\ExceptionBuilder;
+use Vinktar\Internal\Handlers;
 use Vinktar\Internal\Hooks;
 use Vinktar\Internal\Ids;
 use Vinktar\Internal\InboundFilter;
@@ -67,6 +68,7 @@ final class Client
     private readonly array $context;
     private bool $closed = false;
     private ?bool $closeResult = null;
+    private bool $handlersInstalled = false;
 
     /**
      * @param array<string, mixed>|string $options the options, or just the write key
@@ -80,7 +82,7 @@ final class Client
         $this->o = Options::resolve($options, $this->logger);
 
         $this->normalizer = new Normalizer($this->o->maxValueBytes, $this->o->normalizeDepth, Limits::MAX_PROPERTIES_PER_EVENT, $this->o->redactedKeys, $this->o->propertyDenylist);
-        $this->exceptions = new ExceptionBuilder($this->o->projectRoot, $this->o->includeRawStack);
+        $this->exceptions = new ExceptionBuilder($this->o->projectRoot, $this->o->includeRawStack, $this->o->contextLines);
         $this->context = $this->baseContext();
 
         // The configured identity is the root's and nobody else's: fresh scopes and reset() never bring it back.
@@ -118,6 +120,9 @@ final class Client
                     $client->flushAtShutdown();
                 }
             });
+        }
+        if ($this->o->inert === null && $this->o->captureErrors) {
+            $this->registerHandlers();
         }
     }
 
@@ -413,8 +418,13 @@ final class Client
             $frames = [];
             if ($this->o->attachStacktrace) {
                 // The frames of the call site; this method and the guard around it are the SDK's own.
-                $trace = \array_slice(debug_backtrace(\DEBUG_BACKTRACE_IGNORE_ARGS), 2);
-                $frames = $this->exceptions->frames(null, $trace);
+                $backtrace = debug_backtrace(\DEBUG_BACKTRACE_IGNORE_ARGS);
+                foreach ($backtrace as $i => $call) {
+                    if ($call['function'] === 'captureMessage' && ($call['class'] ?? null) === self::class) {
+                        $frames = $this->exceptions->frames(\array_slice($backtrace, $i + 1), $call['file'] ?? '', $call['line'] ?? 0);
+                        break;
+                    }
+                }
             }
 
             // Synthetic: the stack, if any, is where the message was written, not where anything failed.
@@ -538,6 +548,27 @@ final class Client
         return $scope;
     }
 
+    /**
+     * Report uncaught exceptions, PHP warnings and fatal errors, for this client and every other client
+     * that asks. Opt-in (or `captureErrors`), because installing a handler changes what the process
+     * does: the handlers that were there before still run, and a crash still ends the script with the
+     * output and exit code PHP gives it without the SDK.
+     */
+    public function registerHandlers(): void
+    {
+        $this->guarded(function (): void {
+            if ($this->handlersInstalled || $this->closed || $this->o->inert !== null) {
+                return;
+            }
+            $this->handlersInstalled = true;
+            Handlers::register($this, static function (object $client, string $kind, array $details): void {
+                if ($client instanceof self) {
+                    $client->handle($kind, $details);
+                }
+            });
+        });
+    }
+
     // Lifecycle -------------------------------------------------------------------------------------
 
     /**
@@ -587,6 +618,54 @@ final class Client
     }
 
     // Internals -------------------------------------------------------------------------------------
+
+    /**
+     * What a process-wide handler saw.
+     *
+     * @param array<string, mixed> $details
+     */
+    private function handle(string $kind, array $details): void
+    {
+        $this->guarded(function () use ($kind, $details): void {
+            if ($this->closed || $this->o->inert !== null || $this->dispatcher->isStopped()) {
+                return;
+            }
+
+            if ($kind === 'exception' && $details['error'] instanceof \Throwable) {
+                $this->emit($this->exceptions->fromThrowable($details['error']), false, 'uncaughtException', false, [], 'error');
+                // The script ends here; the shutdown flush may never get its turn.
+                $this->dispatcher->flush(microtime(true) + $this->o->shutdownTimeout / 1000);
+
+                return;
+            }
+
+            $type = \is_int($details['type'] ?? null) ? $details['type'] : 0;
+            $message = \is_string($details['message'] ?? null) ? $details['message'] : '';
+            $file = \is_string($details['file'] ?? null) ? $details['file'] : '';
+            $line = \is_int($details['line'] ?? null) ? $details['line'] : 0;
+
+            if ($kind === 'error') {
+                if (($type & Handlers::REPORTED) === 0) {
+                    // Notices and deprecations: context for the next error, not errors of their own.
+                    $this->addBreadcrumb(['category' => 'php', 'message' => $message, 'level' => 'warning', 'data' => ['type' => Handlers::typeName($type), 'file' => $file, 'line' => $line]]);
+
+                    return;
+                }
+                $trace = \is_array($details['trace'] ?? null) ? array_values(array_filter($details['trace'], \is_array(...))) : [];
+                /** @var list<array<string, mixed>> $trace */
+                $level = ($type & (\E_USER_ERROR | \E_RECOVERABLE_ERROR)) !== 0 ? 'error' : 'warning';
+                $this->emit(ExceptionBuilder::fromMessage($message, $this->exceptions->frames($trace, $file, $line), Handlers::typeName($type)), false, 'onerror', true, [], $level);
+
+                return;
+            }
+
+            if ($kind === 'fatal') {
+                // No stack survives a fatal error; the location is all PHP keeps, so the frame is synthetic.
+                $this->emit(ExceptionBuilder::fromMessage($message, $this->exceptions->frames([], $file, $line), Handlers::typeName($type)), true, 'uncaughtException', false, [], 'fatal');
+                $this->dispatcher->flush(microtime(true) + $this->o->shutdownTimeout / 1000);
+            }
+        });
+    }
 
     private function flushAtShutdown(): void
     {

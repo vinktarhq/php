@@ -23,7 +23,7 @@ final class Options
         'maxBreadcrumbs', 'sampleRate', 'errorSampleRate', 'maxErrorsPerMinute', 'maxEventsPerMinute', 'dedupe', 'ignoreErrors',
         'superProperties', 'sendDefaultPii', 'redactedKeys', 'propertyDenylist', 'maxValueBytes', 'normalizeDepth',
         'includeRawStack', 'attachStacktrace', 'projectRoot', 'contextLines', 'beforeSend', 'beforeTrack', 'beforeBreadcrumb',
-        'onError', 'logger', 'transport',
+        'onError', 'logger', 'transport', 'captureErrors',
     ];
 
     /**
@@ -54,6 +54,7 @@ final class Options
         public readonly bool $gzip,
         public readonly int $shutdownTimeout,
         public readonly bool $autoFlush,
+        public readonly bool $captureErrors,
         public readonly int $maxBreadcrumbs,
         public readonly float $sampleRate,
         public readonly float $errorSampleRate,
@@ -245,6 +246,7 @@ final class Options
             gzip: $bool('gzip', true),
             shutdownTimeout: $clampInt('shutdownTimeout', 100, 60_000, 2_000),
             autoFlush: $bool('autoFlush', true),
+            captureErrors: $bool('captureErrors', false),
             maxBreadcrumbs: $clampInt('maxBreadcrumbs', 0, Limits::MAX_BREADCRUMBS, Limits::MAX_BREADCRUMBS),
             sampleRate: $clampRate('sampleRate'),
             errorSampleRate: $clampRate('errorSampleRate'),
