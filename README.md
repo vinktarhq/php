@@ -23,8 +23,11 @@ That is the whole setup for a PHP-FPM request. What is queued is sent when the r
 **PHP 8.2+. Zero runtime dependencies (`ext-curl`, `ext-json`). Never throws into your code.**
 Everything the SDK cannot send is said once, in your logs.
 
-> **Not on Packagist yet.** The first beta is being prepared. Until then, send events over the
-> HTTP API at [vinktar.com/api.md](https://vinktar.com/api.md).
+```sh
+composer require vinktarhq/php:^0.1@beta
+```
+
+This is a beta: the API can still change before 0.1.0, and the changelog says when it does.
 
 ---
 
