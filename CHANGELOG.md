@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0-beta.1
 
 Nothing the SDK does may break the application it is installed in. These are the places where it
 could, and no longer can. `spec/fixtures/hostile.json` holds the rule as cases and `HostileTest`
