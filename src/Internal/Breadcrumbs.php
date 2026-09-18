@@ -72,7 +72,7 @@ final class Breadcrumbs
         $crumb = [
             'timestamp' => \is_string($input['timestamp'] ?? null) ? $input['timestamp'] : Clock::iso(),
             'category' => Bytes::truncate($category, 64),
-            'message' => Bytes::truncate(Scrub::secrets($message), self::MAX_MESSAGE_BYTES),
+            'message' => Scrub::capped($message, self::MAX_MESSAGE_BYTES),
         ];
         if (\in_array($input['level'] ?? null, self::LEVELS, true)) {
             $crumb['level'] = $input['level'];

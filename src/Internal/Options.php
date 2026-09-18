@@ -23,7 +23,7 @@ final class Options
         'maxBreadcrumbs', 'sampleRate', 'errorSampleRate', 'maxErrorsPerMinute', 'maxEventsPerMinute', 'dedupe', 'ignoreErrors',
         'superProperties', 'sendDefaultPii', 'redactedKeys', 'propertyDenylist', 'maxValueBytes', 'normalizeDepth',
         'includeRawStack', 'attachStacktrace', 'projectRoot', 'contextLines', 'beforeSend', 'beforeTrack', 'beforeBreadcrumb',
-        'onError', 'logger', 'transport', 'captureErrors',
+        'onError', 'logger', 'transport', 'captureErrors', 'previousHandlerLevels',
     ];
 
     /**
@@ -55,6 +55,7 @@ final class Options
         public readonly int $shutdownTimeout,
         public readonly bool $autoFlush,
         public readonly bool $captureErrors,
+        public readonly ?int $previousHandlerLevels,
         public readonly int $maxBreadcrumbs,
         public readonly float $sampleRate,
         public readonly float $errorSampleRate,
@@ -84,12 +85,10 @@ final class Options
     /**
      * @param array<string, mixed>                    $options
      * @param (callable(string): (string|false))|null $env     reads an environment variable
-     *
-     * @throws \InvalidArgumentException when the client is enabled and has no write key
      */
     public static function resolve(array $options, Logger $logger, ?callable $env = null): self
     {
-        $env ??= static fn (string $name): string|false => getenv($name);
+        $env ??= static fn (string $name): string|false => self::string(self::call('getenv', $name)) ?? false;
         $read = static function (string $name) use ($env): string {
             $value = $env($name);
 
@@ -162,16 +161,19 @@ final class Options
         if ($writeKey === '') {
             $writeKey = $read('VINKTAR_KEY');
         }
-        // A client switched off on purpose needs no key. One meant to send without one is a
-        // deployment mistake, said once, at startup, where someone is looking.
-        if ($writeKey === '' && $enabled) {
-            throw new \InvalidArgumentException('[vinktar] no write key: pass ["writeKey" => ...] or set VINKTAR_KEY');
-        }
         if ($writeKey !== '' && !str_starts_with($writeKey, 'vnk_pk_') && !str_starts_with($writeKey, 'vnk_sk_')) {
             $logger->warn('the write key does not look like a Vinktar key (vnk_pk_… or vnk_sk_…)');
         }
 
         $inert = $enabled ? null : 'enabled is false';
+        // A client switched off on purpose needs no key. One meant to send without one is a
+        // deployment mistake, said once, at startup, as an error, where someone is looking. It is
+        // not thrown: the application this is installed in did nothing wrong and keeps running.
+        $keyless = $writeKey === '' && $enabled;
+        if ($keyless) {
+            $logger->error('no write key: pass ["writeKey" => ...] or set VINKTAR_KEY. Nothing will be sent');
+            $inert = 'no write key';
+        }
 
         $environment = $text('environment');
         if ($environment === '') {
@@ -214,8 +216,7 @@ final class Options
 
         $serverName = $text('serverName');
         if ($serverName === '') {
-            $hostname = gethostname();
-            $serverName = \is_string($hostname) ? $hostname : '';
+            $serverName = self::string(self::call('gethostname')) ?? '';
         }
 
         $transport = $options['transport'] ?? null;
@@ -229,6 +230,12 @@ final class Options
         }
 
         $onError = $options['onError'] ?? null;
+
+        $previousHandlerLevels = $options['previousHandlerLevels'] ?? null;
+        if ($previousHandlerLevels !== null && !\is_int($previousHandlerLevels)) {
+            $logger->warn('previousHandlerLevels must be an error level mask such as E_ALL; ignored');
+            $previousHandlerLevels = null;
+        }
 
         $resolved = new self(
             writeKey: $writeKey,
@@ -247,6 +254,7 @@ final class Options
             shutdownTimeout: $clampInt('shutdownTimeout', 100, 60_000, 2_000),
             autoFlush: $bool('autoFlush', true),
             captureErrors: $bool('captureErrors', false),
+            previousHandlerLevels: $previousHandlerLevels,
             maxBreadcrumbs: $clampInt('maxBreadcrumbs', 0, Limits::MAX_BREADCRUMBS, Limits::MAX_BREADCRUMBS),
             sampleRate: $clampRate('sampleRate'),
             errorSampleRate: $clampRate('errorSampleRate'),
@@ -272,11 +280,61 @@ final class Options
             inert: $inert,
         );
 
-        if ($inert !== null) {
+        if ($inert !== null && !$keyless) {
             $logger->warn("inert: {$inert}");
         }
 
         return $resolved;
+    }
+
+    /**
+     * The options of a client that does nothing, built from constants alone: what the constructor
+     * falls back to when the real options could not be resolved, so it has no way to fail itself.
+     */
+    public static function inert(string $reason): self
+    {
+        return new self(
+            writeKey: '',
+            host: self::DEFAULT_HOST,
+            analytics: false,
+            errors: false,
+            release: '',
+            environment: 'production',
+            enabledEnvironments: [],
+            serverName: '',
+            initialScope: ['userId' => null, 'deviceId' => null, 'sessionId' => null, 'tags' => [], 'context' => []],
+            flushAt: 20,
+            maxQueueSize: 1000,
+            requestTimeoutMs: 5_000,
+            gzip: false,
+            shutdownTimeout: 2_000,
+            autoFlush: false,
+            captureErrors: false,
+            previousHandlerLevels: null,
+            maxBreadcrumbs: Limits::MAX_BREADCRUMBS,
+            sampleRate: 1.0,
+            errorSampleRate: 1.0,
+            maxErrorsPerMinute: 100,
+            maxEventsPerMinute: 6000,
+            dedupe: true,
+            ignoreErrors: [],
+            superProperties: [],
+            sendDefaultPii: false,
+            redactedKeys: [],
+            propertyDenylist: [],
+            maxValueBytes: Limits::MAX_STRING_BYTES,
+            normalizeDepth: Limits::MAX_DEPTH,
+            includeRawStack: false,
+            attachStacktrace: false,
+            projectRoot: '',
+            contextLines: 0,
+            beforeSend: [],
+            beforeTrack: [],
+            beforeBreadcrumb: [],
+            onError: null,
+            transport: new CurlTransport(),
+            inert: $reason,
+        );
     }
 
     /**
@@ -333,15 +391,39 @@ final class Options
     /** The Composer project the SDK is installed in, or the working directory. */
     private static function projectRoot(): string
     {
-        if (class_exists(\Composer\InstalledVersions::class)) {
-            $root = \Composer\InstalledVersions::getRootPackage()['install_path'];
-            $real = realpath($root);
-            if (\is_string($real)) {
-                return $real;
+        try {
+            if (class_exists(\Composer\InstalledVersions::class)) {
+                $real = self::string(self::call('realpath', \Composer\InstalledVersions::getRootPackage()['install_path']));
+                if ($real !== null) {
+                    return $real;
+                }
             }
+        } catch (\Throwable) {
+            // Composer's own data is missing or not what it should be; the working directory will do.
         }
-        $cwd = getcwd();
 
-        return \is_string($cwd) ? $cwd : '';
+        return self::string(self::call('getcwd')) ?? '';
+    }
+
+    /**
+     * A function the host may have switched off. One named in `disable_functions` does not exist in
+     * PHP 8, and calling it is an Error rather than a warning, so it is looked for first. `@`,
+     * because several of these warn under `open_basedir`.
+     */
+    private static function call(string $function, mixed ...$args): mixed
+    {
+        if (!\function_exists($function)) {
+            return null;
+        }
+        try {
+            return @$function(...$args);
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
+    private static function string(mixed $value): ?string
+    {
+        return \is_string($value) ? $value : null;
     }
 }

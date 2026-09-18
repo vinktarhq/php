@@ -14,6 +14,7 @@ use Vinktar\Internal\Handlers;
 use Vinktar\Internal\Hooks;
 use Vinktar\Internal\Ids;
 use Vinktar\Internal\InboundFilter;
+use Vinktar\Internal\Input;
 use Vinktar\Internal\KeyedValve;
 use Vinktar\Internal\Limits;
 use Vinktar\Internal\Logger;
@@ -38,8 +39,15 @@ use Vinktar\Internal\Valve;
  * `enterScope()` never carries one job's user into the next.
  *
  * Sending is synchronous and bounded. Records are queued and sent when the queue reaches `flushAt`,
- * when you call `flush()`, and at shutdown (`autoFlush`). Nothing here throws into your code except
- * the constructor, when the client is enabled and has no key.
+ * when you call `flush()`, and at shutdown (`autoFlush`).
+ *
+ * Nothing here throws into your code, raises a PHP warning in it, or holds it up for longer than it
+ * asked, whatever it is handed, and that includes the constructor: an enabled client with no key
+ * says so once, as an error, and then does nothing, like a disabled one. The types are in the
+ * PHPDoc and the signatures accept anything, because a caller with `declare(strict_types=1)` would
+ * otherwise get a TypeError for `identify(42)` before a line of this class ran. An argument that
+ * cannot be used is logged and the call does nothing. The one thing that passes through is what
+ * your own callback throws inside `withScope()`.
  *
  * @phpstan-import-type WireException from ExceptionBuilder
  */
@@ -71,22 +79,37 @@ final class Client
     private bool $handlersInstalled = false;
 
     /**
-     * @param array<string, mixed>|string $options the options, or just the write key
+     * Never throws. With no write key (and `enabled` not false) the client logs one error and is inert.
      *
-     * @throws \InvalidArgumentException when the client is enabled and there is no write key
+     * @param array<string, mixed>|string $options the options, or just the write key
      */
-    public function __construct(array|string $options = [])
+    public function __construct(mixed $options = [])
     {
-        $options = \is_string($options) ? ['writeKey' => $options] : $options;
-        $this->logger = new Logger($options['logger'] ?? null, ($options['debug'] ?? false) === true);
-        $this->o = Options::resolve($options, $this->logger);
+        $given = \is_string($options) ? ['writeKey' => $options] : Input::map($options);
+        try {
+            $logger = new Logger($given['logger'] ?? null, ($given['debug'] ?? false) === true);
+        } catch (\Throwable) {
+            $logger = new Logger();
+        }
+        if ($given === null) {
+            $logger->warn('the options must be an array or a write key; '.Input::describe($options).' was ignored');
+        }
+        try {
+            $o = Options::resolve($given ?? [], $logger);
+        } catch (\Throwable $error) {
+            // Whatever went wrong, it is not the application's problem: it gets a client that does nothing.
+            $logger->error('the client could not be set up, so nothing will be sent', ['error' => $error->getMessage()]);
+            $o = Options::inert('the client could not be set up');
+        }
+        $this->logger = $logger;
+        $this->o = $o;
 
         $this->normalizer = new Normalizer($this->o->maxValueBytes, $this->o->normalizeDepth, Limits::MAX_PROPERTIES_PER_EVENT, $this->o->redactedKeys, $this->o->propertyDenylist);
         $this->exceptions = new ExceptionBuilder($this->o->projectRoot, $this->o->includeRawStack, $this->o->contextLines);
         $this->context = $this->baseContext();
 
         // The configured identity is the root's and nobody else's: fresh scopes and reset() never bring it back.
-        $this->root = new Scope($this->o->maxBreadcrumbs, $this->o->initialScope['tags'], $this->o->initialScope['context']);
+        $this->root = new Scope($this->o->maxBreadcrumbs, $this->o->initialScope['tags'], $this->o->initialScope['context'], $this->logger, $this->normalizer);
         $this->root->setUserId($this->o->initialScope['userId']);
         $this->root->setDeviceId($this->o->initialScope['deviceId']);
         $this->root->setSessionId($this->o->initialScope['sessionId']);
@@ -115,11 +138,11 @@ final class Client
         );
 
         if ($this->o->inert === null && $this->o->autoFlush) {
-            Shutdown::register($this, static function (object $client): void {
+            $this->guarded(fn () => Shutdown::register($this, static function (object $client): void {
                 if ($client instanceof self) {
                     $client->flushAtShutdown();
                 }
-            });
+            }));
         }
         if ($this->o->inert === null && $this->o->captureErrors) {
             $this->registerHandlers();
@@ -129,21 +152,25 @@ final class Client
     // Analytics -------------------------------------------------------------------------------------
 
     /**
+     * @param string                                                                                                                                 $name
      * @param array<string, mixed>                                                                                                                   $properties
      * @param array{userId?: string|int|null, deviceId?: string|null, sessionId?: string|null, timestamp?: string|int|float|\DateTimeInterface|null} $options    per-call identity, which never changes the scope
      */
-    public function track(string $name, array $properties = [], array $options = []): void
+    public function track(mixed $name, mixed $properties = [], mixed $options = []): void
     {
         $this->guarded(function () use ($name, $properties, $options): void {
             if (!$this->ready('track')) {
                 return;
             }
-            $name = trim($name);
+            // Cut here, so a name of megabytes is not repeated in every log line about it.
+            $name = Bytes::truncate(trim(Input::text($name) ?? ''), 255);
             if ($name === '') {
                 $this->logger->warn('track() needs an event name; nothing was sent');
 
                 return;
             }
+            $properties = $this->arrayArgument('track', 'properties', $properties);
+            $options = $this->arrayArgument('track', 'options', $options);
             if (!$this->o->analytics) {
                 $this->logger->debug("analytics is off; \"{$name}\" was not sent");
 
@@ -194,7 +221,7 @@ final class Client
                 }),
             );
             $event = [
-                'name' => Bytes::truncate($name, 255),
+                'name' => $name,
                 'event_id' => Ids::uuidv7(),
                 'timestamp' => $timestamp,
                 'payload' => $this->capProperties($name, $payload, $context),
@@ -231,25 +258,31 @@ final class Client
     }
 
     /**
+     * @param string|null                                                                                                                            $name
      * @param array<string, mixed>                                                                                                                   $properties
      * @param array{userId?: string|int|null, deviceId?: string|null, sessionId?: string|null, timestamp?: string|int|float|\DateTimeInterface|null} $options
      */
-    public function page(?string $name = null, array $properties = [], array $options = []): void
+    public function page(mixed $name = null, mixed $properties = [], mixed $options = []): void
     {
-        if ($name !== null && $name !== '') {
-            $properties['$page_name'] = $name;
-        }
-        $this->track('$pageview', $properties, $options);
+        $this->guarded(function () use ($name, $properties, $options): void {
+            $properties = $this->arrayArgument('page', 'properties', $properties);
+            $name = Input::text($name);
+            if ($name !== null && $name !== '') {
+                $properties['$page_name'] = $name;
+            }
+            $this->track('$pageview', $properties, $options);
+        });
     }
 
     /**
      * Set the user on the current scope, and send their traits and the device they were seen on.
      *
+     * @param string|int                                          $userId     an integer id is sent as its string
      * @param array<string, string|int|float|bool>                $traits     last write wins
      * @param array<string, string|int|float|bool>                $traitsOnce first write wins
      * @param array{unset?: list<string>, deviceId?: string|null} $options    `deviceId` links that device for this call only
      */
-    public function identify(string $userId, array $traits = [], array $traitsOnce = [], array $options = []): void
+    public function identify(mixed $userId, mixed $traits = [], mixed $traitsOnce = [], mixed $options = []): void
     {
         $this->guarded(function () use ($userId, $traits, $traitsOnce, $options): void {
             if (!$this->ready('identify')) {
@@ -257,10 +290,13 @@ final class Client
             }
             $id = Ids::validUserId($userId);
             if ($id === null) {
-                $this->logger->warn('identify('.json_encode($userId).') was ignored: not a usable user id');
+                $this->logger->warn('identify('.Input::describe($userId).') was ignored: not a usable user id');
 
                 return;
             }
+            $traits = $this->arrayArgument('identify', 'traits', $traits);
+            $traitsOnce = $this->arrayArgument('identify', 'traitsOnce', $traitsOnce);
+            $options = $this->arrayArgument('identify', 'options', $options);
             $device = self::override($options, 'deviceId', Ids::pickId(...));
             if ($device === false) {
                 $this->drop('invalid', 'identify');
@@ -305,7 +341,7 @@ final class Client
      * @param array<string, string|int|float|bool> $traits
      * @param array<string, string|int|float|bool> $traitsOnce
      */
-    public function setTraits(array $traits, array $traitsOnce = []): void
+    public function setTraits(mixed $traits, mixed $traitsOnce = []): void
     {
         $this->withUser('setTraits', fn (string $id) => $this->identify($id, $traits, $traitsOnce));
     }
@@ -313,7 +349,7 @@ final class Client
     /**
      * @param array<string, string|int|float|bool> $traits
      */
-    public function setTraitsOnce(array $traits): void
+    public function setTraitsOnce(mixed $traits): void
     {
         $this->withUser('setTraitsOnce', fn (string $id) => $this->identify($id, [], $traits));
     }
@@ -321,7 +357,7 @@ final class Client
     /**
      * @param list<string> $keys
      */
-    public function unsetTraits(array $keys): void
+    public function unsetTraits(mixed $keys): void
     {
         $this->withUser('unsetTraits', fn (string $id) => $this->identify($id, [], [], ['unset' => $keys]));
     }
@@ -333,7 +369,7 @@ final class Client
      *
      * @param array<string, mixed>|null $user
      */
-    public function setUser(?array $user): void
+    public function setUser(mixed $user): void
     {
         $this->guarded(function () use ($user): void {
             if ($user === null) {
@@ -341,15 +377,16 @@ final class Client
 
                 return;
             }
+            $user = Input::map($user);
             $id = $user['id'] ?? null;
-            if (!\is_string($id) && !\is_int($id)) {
+            if ($user === null || (!\is_string($id) && !\is_int($id))) {
                 $this->logger->warn('setUser() needs ["id" => …] or null');
 
                 return;
             }
             unset($user['id']);
             $traits = array_filter($user, static fn (mixed $v): bool => \is_scalar($v));
-            $this->identify((string) $id, $traits);
+            $this->identify($id, $traits);
         });
     }
 
@@ -368,7 +405,7 @@ final class Client
      *
      * @param array<string, mixed> $properties
      */
-    public function register(array $properties): void
+    public function register(mixed $properties): void
     {
         $this->guarded(fn () => $this->scopes->current()->register($properties));
     }
@@ -376,12 +413,15 @@ final class Client
     /**
      * @param array<string, mixed> $properties
      */
-    public function registerOnce(array $properties): void
+    public function registerOnce(mixed $properties): void
     {
         $this->guarded(fn () => $this->scopes->current()->registerOnce($properties));
     }
 
-    public function unregister(string $key): void
+    /**
+     * @param string $key
+     */
+    public function unregister(mixed $key): void
     {
         $this->guarded(fn () => $this->scopes->current()->unregister($key));
     }
@@ -389,32 +429,48 @@ final class Client
     // Errors ----------------------------------------------------------------------------------------
 
     /**
+     * @param \Throwable                                                                                                                                                $error
      * @param array{level?: string, tags?: array<string, string>, context?: array<string, mixed>, fingerprint?: list<string>, handled?: bool, userId?: string|int|null} $hint
      *
      * @return string the event id, or '' when nothing was captured
      */
-    public function captureException(\Throwable $error, array $hint = []): string
+    public function captureException(mixed $error, mixed $hint = []): string
     {
         return $this->guarded(function () use ($error, $hint): string {
             if (!$this->ready('captureException')) {
                 return '';
             }
+            if (!$error instanceof \Throwable) {
+                $this->logger->warn('captureException() needs a Throwable; '.Input::describe($error).' was ignored. captureMessage() takes text');
+
+                return '';
+            }
+            $hint = $this->arrayArgument('captureException', 'hint', $hint);
 
             return $this->emit($this->exceptions->fromThrowable($error), false, 'manual', ($hint['handled'] ?? true) !== false, $hint, \is_string($hint['level'] ?? null) ? $hint['level'] : 'error');
         }, '');
     }
 
     /**
+     * @param string                                                                                                                                                    $message
      * @param array{level?: string, tags?: array<string, string>, context?: array<string, mixed>, fingerprint?: list<string>, handled?: bool, userId?: string|int|null} $hint
      *
      * @return string the event id, or '' when nothing was captured
      */
-    public function captureMessage(string $message, array $hint = []): string
+    public function captureMessage(mixed $message, mixed $hint = []): string
     {
         return $this->guarded(function () use ($message, $hint): string {
             if (!$this->ready('captureMessage')) {
                 return '';
             }
+            $text = Input::text($message);
+            if ($text === null) {
+                $this->logger->warn('captureMessage() needs text; '.Input::describe($message).' was ignored');
+
+                return '';
+            }
+            $message = $text;
+            $hint = $this->arrayArgument('captureMessage', 'hint', $hint);
             $frames = [];
             if ($this->o->attachStacktrace) {
                 // The frames of the call site; this method and the guard around it are the SDK's own.
@@ -437,7 +493,7 @@ final class Client
      *
      * @param array{message?: string, category?: string, level?: string, data?: array<string, mixed>, timestamp?: string} $crumb
      */
-    public function addBreadcrumb(array $crumb): void
+    public function addBreadcrumb(mixed $crumb): void
     {
         $this->guarded(function () use ($crumb): void {
             if ($this->closed || $this->o->inert !== null) {
@@ -445,26 +501,31 @@ final class Client
             }
             $shaped = Breadcrumbs::shape($crumb, $this->normalizer);
             if ($shaped === null) {
+                $this->logger->warn('addBreadcrumb() needs an array with a message or data; nothing was added');
+
                 return;
             }
             $hooked = Hooks::run($this->o->beforeBreadcrumb, $shaped);
-            $value = $hooked['value'];
-            if (\is_array($value) && \is_string($value['timestamp'] ?? null) && \is_string($value['category'] ?? null) && \is_string($value['message'] ?? null)) {
-                /** @var array{timestamp: string, category: string, message: string, level?: string, data?: array<string, mixed>} $value */
-                $this->scopes->current()->addBreadcrumb($value);
+            if ($hooked['value'] !== null) {
+                // The scope shapes it again: what a hook returned meets the same bounds.
+                $this->scopes->current()->addBreadcrumb($hooked['value']);
             }
         });
     }
 
-    public function setTag(string $key, string $value): void
+    /**
+     * @param string                $key
+     * @param string|int|float|bool $value
+     */
+    public function setTag(mixed $key, mixed $value): void
     {
         $this->guarded(fn () => $this->scopes->current()->setTag($key, $value));
     }
 
     /**
-     * @param array<string, string> $tags
+     * @param array<string, string|int|float|bool> $tags
      */
-    public function setTags(array $tags): void
+    public function setTags(mixed $tags): void
     {
         $this->guarded(fn () => $this->scopes->current()->setTags($tags));
     }
@@ -474,7 +535,7 @@ final class Client
      *
      * @param array<string, mixed>|null $context
      */
-    public function setContext(?array $context): void
+    public function setContext(mixed $context): void
     {
         $this->guarded(fn () => $this->scopes->current()->setContext($context));
     }
@@ -484,21 +545,29 @@ final class Client
     /** The current scope. */
     public function scope(): Scope
     {
-        return $this->scopes->current();
+        return $this->guarded(fn (): Scope => $this->scopes->current(), $this->root);
     }
 
     /**
      * Run $work in a child of the current scope: it starts as a copy, and what changes inside stays
-     * inside. Returns what $work returns, and lets what it throws through, unreported.
+     * inside. Returns what $work returns, and lets what it throws through, unreported. That is the
+     * application's own exception, and the only thing this class ever lets out. Given something that
+     * is not callable, it logs that and returns null.
      *
      * @template T
      *
      * @param callable(Scope): T $work
      *
-     * @return T
+     * @return T|null
      */
-    public function withScope(callable $work): mixed
+    public function withScope(mixed $work): mixed
     {
+        if (!\is_callable($work)) {
+            $this->logger->warn('withScope() needs a callable; '.Input::describe($work).' was not run');
+
+            return null;
+        }
+
         return $this->scopes->run($this->scopes->current()->fork(), $work);
     }
 
@@ -509,10 +578,12 @@ final class Client
      */
     public function enterScope(): Scope
     {
-        $fresh = $this->root->detached();
-        $this->scopes->enter($fresh);
+        return $this->guarded(function (): Scope {
+            $fresh = $this->root->detached();
+            $this->scopes->enter($fresh);
 
-        return $fresh;
+            return $fresh;
+        }, $this->root);
     }
 
     /**
@@ -522,30 +593,35 @@ final class Client
      *
      * @param array<string, mixed> $headers
      */
-    public function scopeFromHeaders(array $headers): Scope
+    public function scopeFromHeaders(mixed $headers): Scope
     {
-        $scope = $this->scopes->current();
-        $found = [];
-        foreach ($headers as $name => $value) {
-            $key = strtolower(str_replace('_', '-', (string) $name));
-            if (str_starts_with($key, 'http-')) {
-                $key = substr($key, 5);
-            }
-            if (\is_array($value)) {
-                $value = $value[array_key_first($value)] ?? null;
-            }
-            $found[$key] = $value;
-        }
-        $device = Ids::pickId($found['x-vinktar-device-id'] ?? null);
-        $session = Ids::pickId($found['x-vinktar-session-id'] ?? null);
-        if ($device !== null) {
-            $scope->setDeviceId($device);
-        }
-        if ($session !== null) {
-            $scope->setSessionId($session);
-        }
+        return $this->guarded(function () use ($headers): Scope {
+            $scope = $this->scopes->current();
+            $headers = Input::map($headers);
+            if ($headers === null) {
+                $this->logger->warn('scopeFromHeaders() needs an array of headers; nothing was adopted');
 
-        return $scope;
+                return $scope;
+            }
+            $found = [];
+            foreach ($headers as $name => $value) {
+                $key = strtolower(str_replace('_', '-', $name));
+                if (str_starts_with($key, 'http-')) {
+                    $key = substr($key, 5);
+                }
+                $found[$key] = Input::header($value);
+            }
+            $device = Ids::pickId($found['x-vinktar-device-id'] ?? null);
+            $session = Ids::pickId($found['x-vinktar-session-id'] ?? null);
+            if ($device !== null) {
+                $scope->setDeviceId($device);
+            }
+            if ($session !== null) {
+                $scope->setSessionId($session);
+            }
+
+            return $scope;
+        }, $this->root);
     }
 
     /**
@@ -565,7 +641,7 @@ final class Client
                 if ($client instanceof self) {
                     $client->handle($kind, $details);
                 }
-            });
+            }, $this->o->previousHandlerLevels, $this->logger);
         });
     }
 
@@ -577,14 +653,16 @@ final class Client
      */
     public function flush(): bool
     {
-        if ($this->o->inert !== null) {
-            return true;
-        }
-        if ($this->closed) {
-            return $this->closeResult ?? false;
-        }
+        return $this->guarded(function (): bool {
+            if ($this->o->inert !== null) {
+                return true;
+            }
+            if ($this->closed) {
+                return $this->closeResult ?? false;
+            }
 
-        return $this->dispatcher->flush();
+            return $this->dispatcher->flush();
+        }, false);
     }
 
     /**
@@ -601,20 +679,18 @@ final class Client
             return $this->closeResult = true;
         }
 
-        $ok = false;
-        try {
-            $deadline = microtime(true) + $this->o->shutdownTimeout / 1000;
-            $ok = $this->dispatcher->flush($deadline) && $this->dispatcher->pending() === 0;
-        } finally {
-            $left = $this->dispatcher->pending();
-            if ($left > 0) {
-                $this->dispatcher->abandon('send_error');
-                $this->logger->warn("close(): {$left} record(s) could not be delivered and are lost");
+        return $this->closeResult = $this->guarded(function (): bool {
+            try {
+                return $this->dispatcher->flush($this->deadline()) && $this->dispatcher->pending() === 0;
+            } finally {
+                $left = $this->dispatcher->pending();
+                if ($left > 0) {
+                    $this->dispatcher->abandon('send_error');
+                    $this->logger->warn("close(): {$left} record(s) could not be delivered and are lost");
+                }
+                $this->dispatcher->stop();
             }
-            $this->dispatcher->stop();
-        }
-
-        return $this->closeResult = $ok;
+        }, false);
     }
 
     // Internals -------------------------------------------------------------------------------------
@@ -634,7 +710,7 @@ final class Client
             if ($kind === 'exception' && $details['error'] instanceof \Throwable) {
                 $this->emit($this->exceptions->fromThrowable($details['error']), false, 'uncaughtException', false, [], 'error');
                 // The script ends here; the shutdown flush may never get its turn.
-                $this->dispatcher->flush(microtime(true) + $this->o->shutdownTimeout / 1000);
+                $this->dispatcher->flush($this->deadline());
 
                 return;
             }
@@ -662,7 +738,7 @@ final class Client
             if ($kind === 'fatal') {
                 // No stack survives a fatal error; the location is all PHP keeps, so the frame is synthetic.
                 $this->emit(ExceptionBuilder::fromMessage($message, $this->exceptions->frames([], $file, $line), Handlers::typeName($type)), true, 'uncaughtException', false, [], 'fatal');
-                $this->dispatcher->flush(microtime(true) + $this->o->shutdownTimeout / 1000);
+                $this->dispatcher->flush($this->deadline());
             }
         });
     }
@@ -672,7 +748,7 @@ final class Client
         if ($this->closed || $this->o->inert !== null) {
             return;
         }
-        $this->dispatcher->flush(microtime(true) + $this->o->shutdownTimeout / 1000);
+        $this->dispatcher->flush($this->deadline());
         $left = $this->dispatcher->pending();
         if ($left > 0) {
             $this->logger->warn("{$left} record(s) were not delivered before the process ended");
@@ -825,10 +901,8 @@ final class Client
             $headers = [];
             foreach ($request['headers'] as $key => $value) {
                 $name = strtolower((string) $key);
-                if (\is_array($value)) {
-                    $value = $value[array_key_first($value)] ?? null;
-                }
-                if (\in_array($name, self::NEVER_HEADERS, true) || !\is_string($value)) {
+                $value = Input::header($value);
+                if (\in_array($name, self::NEVER_HEADERS, true) || $value === null) {
                     continue;
                 }
                 if (!$this->o->sendDefaultPii && !\in_array($name, self::SAFE_HEADERS, true)) {
@@ -913,11 +987,39 @@ final class Client
         $this->dispatcher->reports->record($reason, $category);
     }
 
+    /**
+     * The queue reached `flushAt`. This send runs inside the application's own track() or
+     * captureException(), so it gets the budget the shutdown flush gets, one deadline for both
+     * queues, and not a full request timeout for each. When the host does not answer, the backoff
+     * holds its categories, and the captures that follow return without trying.
+     */
     private function afterCapture(): void
     {
         if ($this->dispatcher->events->count() >= $this->o->flushAt || $this->dispatcher->errors->count() >= $this->o->flushAt) {
-            $this->dispatcher->flush();
+            $this->dispatcher->flush($this->deadline());
         }
+    }
+
+    /** When a flush that must not hold the application up stops starting requests: `shutdownTimeout` from now. */
+    private function deadline(): float
+    {
+        return microtime(true) + $this->o->shutdownTimeout / 1000;
+    }
+
+    /**
+     * An argument documented as an array. Null is "not given"; anything else that is not an array is
+     * said once and treated as empty, so the call still does what the rest of it asked.
+     *
+     * @return array<string, mixed>
+     */
+    private function arrayArgument(string $method, string $name, mixed $value): array
+    {
+        $map = Input::map($value);
+        if ($map === null && $value !== null) {
+            $this->logger->warn("{$method}(): {$name} must be an array; ".Input::describe($value).' was ignored');
+        }
+
+        return $map ?? [];
     }
 
     private function timestampFor(mixed $value, string $name): ?string

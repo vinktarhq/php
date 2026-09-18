@@ -31,13 +31,14 @@ final class Ids
         return $trimmed === '' || \in_array(strtolower($trimmed), self::BLOCKED, true);
     }
 
-    /** A user id the server accepts: a non-empty, non-blocked string of at most 255 characters. */
+    /**
+     * A user id the server accepts: a non-empty, non-blocked string of at most 255 characters. An
+     * integer is an id too (a primary key usually is one), and so is a Stringable.
+     */
     public static function validUserId(mixed $value): ?string
     {
-        if (\is_int($value) || (\is_float($value) && is_finite($value))) {
-            $value = (string) $value;
-        }
-        if (!\is_string($value)) {
+        $value = Input::text($value);
+        if ($value === null) {
             return null;
         }
         $id = trim($value);

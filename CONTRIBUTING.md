@@ -19,6 +19,10 @@ here. `tests/Spec` runs every constant and fixture in it: limits, blocked ids, t
 trait parsing, sampling, and every row of the response table, headers included. A number that
 drifts from the published one fails the build rather than a customer's request.
 
+`spec/fixtures/hostile.json` is what an application can hand an SDK that must not break it:
+cycles, values whose serialiser throws or never ends, the wrong type in every argument, a host that
+never answers. `HostileTest` runs every case that applies to PHP and says why it skips the rest.
+
 `spec/fixtures/scenarios.json` describes behaviour every Vinktar SDK must share. `ScenariosTest`
 lists the server-side ones; each is reported as incomplete until the client can run it, so a test
 run always shows what is still owed. (`fixtures/stacks.json` is JavaScript stack text and does not
@@ -29,8 +33,14 @@ apply to PHP.)
 - **Zero runtime dependencies.** Composer's `require` holds PHP and extensions, nothing else.
 - **Nothing fails silently.** Every drop, refusal and no-op is a warning that names the
   consequence, logged once and rate limited.
-- **Never throw into the application.** The one exception is constructing an enabled client
-  without a key, which is a misconfiguration and throws on purpose.
+- **Never break the application.** Nothing throws into it, raises a warning, notice or deprecation
+  in it, holds it up for longer than it asked, or changes what it does, whatever it is handed. There
+  are no exceptions, the constructor included: a client with no key logs an error and is inert.
+  Public methods take `mixed` with the real types in PHPDoc, and read every argument through
+  `Internal\Input` before anything else, because a `strict_types` caller gets a `TypeError` before
+  a typed method's body runs. `spec/fixtures/hostile.json` is this rule as cases, and `HostileTest`
+  runs them on a host whose error handler throws for every level. A new public method or option
+  needs to survive the same.
 - **No state in statics.** A long-running worker serves many people; a static is how one job's user
   ends up on the next job's events.
 - Comments explain *why*, not *what*, and are worth writing where a rule looks arbitrary.

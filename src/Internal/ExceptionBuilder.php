@@ -57,11 +57,11 @@ final class ExceptionBuilder
             $exception = [
                 'type' => Bytes::truncate($current::class, Limits::MAX_TYPE_BYTES),
                 // Scrubbed before truncating: a token cut in half is still most of a token.
-                'value' => Bytes::truncate(Scrub::secrets($current->getMessage()), Limits::MAX_MESSAGE_BYTES),
+                'value' => Scrub::capped($current->getMessage(), Limits::MAX_MESSAGE_BYTES),
                 'stack' => $this->stack($current->getTrace(), $current->getFile(), $current->getLine()),
             ];
             if ($this->includeRawStack) {
-                $exception['stack_raw'] = Bytes::truncate(Scrub::secrets($current->getTraceAsString()), Limits::MAX_STACK_RAW_BYTES);
+                $exception['stack_raw'] = Scrub::capped($current->getTraceAsString(), Limits::MAX_STACK_RAW_BYTES);
             }
             $chain[] = $exception;
             $current = $current->getPrevious();
@@ -79,7 +79,7 @@ final class ExceptionBuilder
      */
     public static function fromMessage(string $message, array $stack = [], string $type = 'Message'): array
     {
-        return [['type' => Bytes::truncate($type, Limits::MAX_TYPE_BYTES), 'value' => Bytes::truncate(Scrub::secrets($message), Limits::MAX_MESSAGE_BYTES), 'stack' => $stack]];
+        return [['type' => Bytes::truncate($type, Limits::MAX_TYPE_BYTES), 'value' => Scrub::capped($message, Limits::MAX_MESSAGE_BYTES), 'stack' => $stack]];
     }
 
     /**
@@ -206,7 +206,7 @@ final class ExceptionBuilder
 
         if ($lines !== null) {
             $index = $line - 1;
-            $clean = static fn (string $text): string => Bytes::truncate(Scrub::secrets($text), self::MAX_LINE_BYTES);
+            $clean = static fn (string $text): string => Scrub::capped($text, self::MAX_LINE_BYTES);
             $frame['pre_context'] = array_map($clean, \array_slice($lines, max(0, $index - $this->contextLines), min($index, $this->contextLines)));
             $frame['context_line'] = $clean($lines[$index]);
             $frame['post_context'] = array_map($clean, \array_slice($lines, $index + 1, $this->contextLines));
@@ -228,9 +228,16 @@ final class ExceptionBuilder
         }
         if (!\array_key_exists($file, $this->sources)) {
             $lines = null;
-            if (is_file($file) && is_readable($file) && (int) filesize($file) <= self::MAX_SOURCE_FILE_BYTES) {
-                $read = file($file, \FILE_IGNORE_NEW_LINES);
-                $lines = \is_array($read) ? $read : null;
+            try {
+                // Silenced: outside `open_basedir` each of these warns, and a warning raised while an
+                // error is being reported would reach the application's handler and cost the report.
+                if (@is_file($file) && @is_readable($file) && (int) @filesize($file) <= self::MAX_SOURCE_FILE_BYTES) {
+                    $read = @file($file, \FILE_IGNORE_NEW_LINES);
+                    $lines = \is_array($read) ? $read : null;
+                }
+            } catch (\Throwable) {
+                // A handler that throws even for a silenced call. The frame goes without its source.
+                $lines = null;
             }
             if (\count($this->sources) >= self::CACHE_SIZE) {
                 unset($this->sources[array_key_first($this->sources)]);

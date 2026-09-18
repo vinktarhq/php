@@ -1,5 +1,8 @@
 parameters:
     level: max
+    # The public methods take `mixed` and document the real type, then check it: a caller is not
+    # held to PHPDoc, so neither is the analysis of those checks.
+    treatPhpDocTypesAsCertain: false
     phpVersion:
         min: 80200
         max: 80599

@@ -21,6 +21,8 @@ final class Logger
 {
     private const MAX_REMEMBERED = 200;
     private const MAX_PER_MINUTE = 30;
+    /** A line can quote what the application passed in, and that can be any size. */
+    private const MAX_LINE_BYTES = 2048;
 
     /** @var callable(string, string, array<string, mixed>): void */
     private $sink;
@@ -52,6 +54,7 @@ final class Logger
      */
     public function warn(string $message, array $context = []): void
     {
+        $message = Bytes::truncate($message, self::MAX_LINE_BYTES);
         if ($this->admit($message)) {
             $this->emit('warning', $message, $context);
         }
@@ -95,7 +98,7 @@ final class Logger
     private function emit(string $level, string $message, array $context): void
     {
         try {
-            ($this->sink)($level, '[vinktar] '.$message, $context);
+            ($this->sink)($level, '[vinktar] '.Bytes::truncate($message, self::MAX_LINE_BYTES), $context);
         } catch (\Throwable) {
             // A sink that throws must not take the application down with it.
         }
@@ -119,7 +122,8 @@ final class Logger
 
         return static function (string $level, string $message, array $context): void {
             if ($level === 'warning' || $level === 'error') {
-                error_log($context === [] ? $message : $message.' '.json_encode($context, \JSON_UNESCAPED_SLASHES | \JSON_INVALID_UTF8_SUBSTITUTE | \JSON_PARTIAL_OUTPUT_ON_ERROR));
+                // Silenced: a destination that cannot be written is not the application's warning to get.
+                @error_log($context === [] ? $message : $message.' '.json_encode($context, \JSON_UNESCAPED_SLASHES | \JSON_INVALID_UTF8_SUBSTITUTE | \JSON_PARTIAL_OUTPUT_ON_ERROR));
             }
         };
     }
