@@ -21,7 +21,8 @@ $vinktar->track('order_created', ['total' => 42]);
 That is the whole setup for a PHP-FPM request. What is queued is sent when the request ends.
 
 **PHP 8.2+. Zero runtime dependencies (`ext-curl`, `ext-json`). Never throws into your code.**
-Everything the SDK cannot send is said once, in your logs.
+Not from the constructor, not for an argument of the wrong type under `strict_types`, not for a
+value that cannot be serialised. Everything the SDK cannot send is said once, in your logs.
 
 ```sh
 composer require vinktarhq/php:^0.1@beta
@@ -49,9 +50,9 @@ This is a beta: the API can still change before 0.1.0, and the changelog says wh
 
 A server can use the project's write key (`vnk_pk_…`) or a secret key (`vnk_sk_…`); both can
 append events. Keys are created in the project settings. `new Client()` reads `VINKTAR_KEY` when
-you pass none, and throws when there is still none: a server with no key is misconfigured, and
-that belongs in the first deploy's logs. A client built with `'enabled' => false` needs no key and
-does nothing.
+you pass none. When there is still none it does not throw: it logs one line at error level, in the
+first deploy's logs where a missing key belongs, and from then on behaves like a client built with
+`'enabled' => false`, which needs no key and does nothing. `flush()` and `close()` return `true`.
 
 ## Analytics
 
@@ -78,6 +79,14 @@ $vinktar->track('invoice_paid', ['total' => 90], ['userId' => $invoice->ownerId]
 An explicit id that is not usable (`''`, `'guest'`, `'null'`, …) refuses the event rather than
 sending it as whoever is on the scope.
 
+The types in the method signatures are documentation: every public method accepts anything, so a
+file with `declare(strict_types=1)` never gets a `TypeError` from the SDK. What can sensibly be
+used is: an integer or `Stringable` user id is sent as its string (`identify($row['id'])` works),
+and a tag value can be a number or a boolean. Anything else is logged once and the call does
+nothing. Values inside properties and context can be anything at all, including objects whose
+`jsonSerialize()` or `__toString()` throws, cycles, `NAN` and resources: each becomes a placeholder
+such as `[Circular]` or `[Unreadable]`, and the event is still sent.
+
 ## Scopes and identity
 
 A scope holds the user, device, session, tags, error context, request, breadcrumbs and registered
@@ -95,7 +104,8 @@ $vinktar->enterScope();
 ```
 
 `withScope()` starts from a copy of the current scope, returns what the callback returns, and lets
-what it throws through, unreported. `enterScope()` starts a fresh one: the tags, context and
+what it throws through, unreported: your callback's own exception is the only thing the SDK ever
+lets out. Given something that is not callable, it logs that and returns `null`. `enterScope()` starts a fresh one: the tags, context and
 properties set for the whole process, and never a user, device, session or breadcrumbs from earlier
 work.
 
@@ -105,6 +115,10 @@ scope and applies the configured `initialScope` tags and context again, never a 
 `scopeFromHeaders()` adopts the browser SDK's `X-Vinktar-Device-Id` and `X-Vinktar-Session-Id`, from
 `$_SERVER`, `getallheaders()` or a PSR-7 `getHeaders()` array. They are validated, and they are
 correlation, never authentication.
+
+`$vinktar->scope()` is the current scope itself, with the same `setTag()`, `setTags()`,
+`setContext()`, `setRequest()`, `register()`, `registerOnce()` and `unregister()`. The client's
+methods of those names are these, so an argument is treated the same way through either.
 
 ## Errors
 
@@ -131,6 +145,26 @@ logs and displays, and a crash ends the script with the output and exit code PHP
 the SDK. Warnings are reported unless `error_reporting()` or `@` says otherwise; notices and
 deprecations become breadcrumbs. Fatal errors, out-of-memory included, are reported at shutdown.
 
+One part of that needs your help when the application (or its framework) has an error handler of
+its own. `set_error_handler()` takes a mask of levels, PHP only calls the handler for those, and
+PHP has no way to ask what the mask was. A handler registered for `E_WARNING` that throws must not
+suddenly be called for a deprecation because the SDK sits in front of it, and a handler must not
+go quiet either. So the SDK does not guess:
+
+```php
+new Vinktar\Client(['writeKey' => $key, 'captureErrors' => true, 'previousHandlerLevels' => E_ALL]);
+```
+
+`previousHandlerLevels` is the mask the existing handler was registered with: `E_ALL` for Symfony,
+Laravel and any `set_error_handler($handler)` with no second argument. The SDK then forwards
+exactly those levels to it, with the same arguments, and returns what it returns; every other level
+gets PHP's standard handling, as it did before. Without the option, and with a handler already
+installed, the SDK leaves the error handler alone and says so once in the log: uncaught exceptions
+and fatal errors are still reported, warnings and the breadcrumbs from notices are not. That is
+the trade: a missing option costs you warnings in Vinktar, never a change in what your application
+does. With no handler installed before the SDK there is nothing to declare. (A framework that
+turns warnings into `ErrorException`s reports them as exceptions either way.)
+
 Errors carry the `getPrevious()` chain, frames with the application's marked and made relative to
 the project root, and a few lines of source around the frames nearest the crash. Secrets in
 messages and source lines (card numbers, API tokens, bearer headers) are masked before they leave.
@@ -154,7 +188,10 @@ $vinktar->close();                // once, when a worker stops
 ```
 
 Sending is synchronous and bounded. Records are sent when the queue reaches `flushAt`, when you
-call `flush()`, and when the process shuts down (`autoFlush`). There is no background thread and
+call `flush()`, and when the process shuts down (`autoFlush`). The send that `flushAt` triggers
+happens inside your `track()` or `captureException()` call, so it is held to `shutdownTimeout`
+for everything it sends, not to a request timeout per endpoint; when the host does not answer, the
+next captures queue and return at once until the backoff has passed. There is no background thread and
 nothing ever sleeps: when the server asks the SDK to wait (a rate limit, an outage), the wait is
 remembered, and a flush during it returns `false` at once.
 
@@ -169,7 +206,7 @@ stops. Every later call gets the same answer.
 
 | Option | Default | |
 |---|---|---|
-| `writeKey` | `$VINKTAR_KEY` | Required unless `enabled` is false. |
+| `writeKey` | `$VINKTAR_KEY` | Without one the client logs an error and sends nothing. |
 | `host` | `$VINKTAR_HOST`, `https://in.vinktar.com` | |
 | `enabled` | `true` | `false`: no key needed, nothing sent. |
 | `environment` | `$VINKTAR_ENVIRONMENT`, `$APP_ENV`, `production` | |
@@ -182,10 +219,11 @@ stops. Every later call gets the same answer.
 | `flushAt` | `20` | Records that trigger a send. |
 | `maxQueueSize` | `1000` | Oldest dropped beyond it, and counted. |
 | `requestTimeoutMs` | `5000` | One deadline for the whole request. |
-| `shutdownTimeout` | `2000` | The bound on `close()` and the shutdown flush. |
+| `shutdownTimeout` | `2000` | The bound on `close()`, the shutdown flush, and a send triggered by `flushAt`. |
 | `autoFlush` | `true` | Flush when the process shuts down. |
 | `gzip` | `true` | Bodies over 1 KiB, when `ext-zlib` is loaded. |
 | `captureErrors` | `false` | Install the error handlers. |
+| `previousHandlerLevels` | | The levels your own error handler was registered for (`E_ALL` for most frameworks). See [Errors](#errors). |
 | `sampleRate`, `errorSampleRate` | `1` | Deterministic per user, or per issue. |
 | `maxEventsPerMinute`, `maxErrorsPerMinute` | `6000`, `100` | |
 | `dedupe` | `true` | |

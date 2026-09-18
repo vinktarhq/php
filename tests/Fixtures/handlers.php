@@ -26,12 +26,22 @@ if ($mode === 'previous') {
     });
 }
 
+if ($mode === 'narrow-previous' || $mode === 'undeclared-previous') {
+    // An application handler registered for one level, which also stops PHP's own handling of it.
+    set_error_handler(static function (int $type, string $message, string $file, int $line): bool {
+        echo "previous error handler saw: {$type} {$message} at ".basename($file).":{$line}\n";
+
+        return true;
+    }, E_USER_WARNING);
+}
+
 $options = static fn (string $path): array => [
     'writeKey' => 'vnk_sk_handlers',
     'transport' => new FileTransport($path),
     'captureErrors' => true,
     'logger' => static function (): void {},
     'projectRoot' => dirname(__DIR__, 2),
+    ...($mode === 'narrow-previous' ? ['previousHandlerLevels' => E_USER_WARNING] : []),
 ];
 $client = $withSdk ? new Client($options($out)) : null;
 $other = $withSdk && $second !== null ? new Client($options($second)) : null;
@@ -53,6 +63,15 @@ switch ($mode) {
         trigger_error('a warning the application raised', E_USER_WARNING);
         @trigger_error('a silenced warning', E_USER_WARNING);
         trigger_error('a notice', E_USER_NOTICE);
+        echo "continued\n";
+        $client?->captureMessage('after the warnings');
+        break;
+
+    case 'narrow-previous':
+    case 'undeclared-previous':
+        trigger_error('a warning the application raised', E_USER_WARNING);
+        trigger_error('a deprecation its handler never asked for', E_USER_DEPRECATED);
+        trigger_error('a notice its handler never asked for', E_USER_NOTICE);
         echo "continued\n";
         $client?->captureMessage('after the warnings');
         break;

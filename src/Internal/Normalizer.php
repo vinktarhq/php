@@ -13,11 +13,25 @@ namespace Vinktar\Internal;
  * difference between a slightly shorter field and no data at all. What comes out is always
  * JSON-encodable: no resources, no NAN or INF, no cycles.
  *
+ * It is also about surviving the value. A value's own code runs here (`jsonSerialize()`,
+ * `__toString()`), and it can throw, or return a fresh copy of itself forever. So the walk is
+ * bounded three ways, none of which depends on what the value says about itself: the depth the
+ * server accepts, a fixed number of `jsonSerialize()` results followed for one value, and a budget
+ * of nodes for one call. Past any of them the value becomes a placeholder. Without that, the way
+ * out of a self-replicating serialiser is the memory limit, which no `catch` sees.
+ *
  * @internal
  */
 final class Normalizer
 {
     public const REDACTED = '[redacted]';
+
+    public const UNREADABLE = '[Unreadable]';
+
+    /** `jsonSerialize()` results followed for one value before giving up on it. */
+    private const MAX_UNWRAPS = 8;
+    /** Nested values visited in one normalize() call. An event the server accepts has far fewer. */
+    private const MAX_NODES = 10_000;
 
     private const SENSITIVE = '/pass|token|secret|auth|api[-_]?key|cookie|credential|card|cvv|ssn/i';
 
@@ -44,6 +58,7 @@ final class Normalizer
     {
         $out = [];
         $count = 0;
+        $budget = self::MAX_NODES;
         foreach ($props as $key => $value) {
             $key = (string) $key;
             if ($count >= $this->maxProperties) {
@@ -56,7 +71,7 @@ final class Normalizer
             if (\in_array($key, $this->propertyDenylist, true)) {
                 continue;
             }
-            $out[$key] = $this->visit($key, $value, 1, new \SplObjectStorage(), $onDrop);
+            $out[$key] = $this->visit($key, $value, 1, new \SplObjectStorage(), $onDrop, $budget);
             ++$count;
         }
 
@@ -64,9 +79,10 @@ final class Normalizer
     }
 
     /**
-     * @param \SplObjectStorage<object, mixed> $path the objects on the way down to this value, for cycles
+     * @param \SplObjectStorage<object, mixed> $path   the objects on the way down to this value, for cycles
+     * @param int                              $budget nodes left for this normalize() call
      */
-    private function visit(string $key, mixed $value, int $depth, \SplObjectStorage $path, ?callable $onDrop): mixed
+    private function visit(string $key, mixed $value, int $depth, \SplObjectStorage $path, ?callable $onDrop, int &$budget): mixed
     {
         if (self::isSensitiveKey($key, $this->redactedKeys)) {
             return self::REDACTED;
@@ -85,7 +101,38 @@ final class Normalizer
         if ($value === null || \is_int($value) || \is_bool($value)) {
             return $value;
         }
-        if (\is_resource($value) || (\is_object($value) && \get_class($value) === 'CurlHandle')) {
+        if (\is_array($value)) {
+            // The server counts payload and context themselves as depth 1, so a value that would land
+            // at depth 4 is refused. Collapse it rather than lose the event, and say so. This is also
+            // what ends an array that holds itself by reference.
+            if ($depth >= $this->maxDepth) {
+                if ($onDrop !== null) {
+                    $onDrop($key, 'depth');
+                }
+
+                return (array_is_list($value) ? '[Array(' : '[Object(').\count($value).')]';
+            }
+
+            return $this->children($key, $value, $depth, $path, $onDrop, $budget);
+        }
+        if (!\is_object($value)) {
+            return '[Resource]';
+        }
+
+        try {
+            return $this->object($key, $value, $depth, $path, $onDrop, $budget);
+        } catch (\Throwable) {
+            // The value's own code threw. One unreadable property, not a lost event.
+            return self::UNREADABLE;
+        }
+    }
+
+    /**
+     * @param \SplObjectStorage<object, mixed> $path
+     */
+    private function object(string $key, object $value, int $depth, \SplObjectStorage $path, ?callable $onDrop, int &$budget): mixed
+    {
+        if ($value::class === 'CurlHandle') {
             return '[Resource]';
         }
         if ($value instanceof \Closure) {
@@ -103,53 +150,51 @@ final class Normalizer
         if ($value instanceof \Throwable) {
             return ['name' => $value::class, 'message' => Bytes::truncate($value->getMessage(), $this->maxStringBytes)];
         }
+        if ($path->offsetExists($value)) {
+            return '[Circular]';
+        }
 
-        if (\is_object($value)) {
-            if ($path->offsetExists($value)) {
-                return '[Circular]';
-            }
-            if ($value instanceof \JsonSerializable) {
-                $path->offsetSet($value, null);
-                try {
-                    return $this->visit($key, $value->jsonSerialize(), $depth, $path, $onDrop);
-                } finally {
-                    $path->offsetUnset($value);
-                }
-            }
-            if ($value instanceof \Stringable) {
-                return $this->visit($key, (string) $value, $depth, $path, $onDrop);
-            }
-            $vars = get_object_vars($value);
-            if ($depth >= $this->maxDepth) {
-                if ($onDrop !== null) {
-                    $onDrop($key, 'depth');
-                }
-
-                return '[Object('.\count($vars).')]';
-            }
-            $path->offsetSet($value, null);
+        if ($value instanceof \JsonSerializable) {
+            // Followed in a loop, not by recursing: what it returns is the same value in another
+            // form and sits at the same depth, so depth alone would never end a serialiser that
+            // returns a new serialiser.
+            $form = $value;
+            $seen = [];
             try {
-                return $this->children($key, $vars, $depth, $path, $onDrop);
-            } finally {
-                $path->offsetUnset($value);
-            }
-        }
-
-        if (\is_array($value)) {
-            // The server counts payload and context themselves as depth 1, so a value that would land
-            // at depth 4 is refused. Collapse it rather than lose the event, and say so.
-            if ($depth >= $this->maxDepth) {
-                if ($onDrop !== null) {
-                    $onDrop($key, 'depth');
+                for ($unwraps = 0; $form instanceof \JsonSerializable; ++$unwraps) {
+                    if ($unwraps >= self::MAX_UNWRAPS || --$budget < 0 || $path->offsetExists($form)) {
+                        return self::UNREADABLE;
+                    }
+                    $path->offsetSet($form, null);
+                    $seen[] = $form;
+                    $form = $form->jsonSerialize();
                 }
 
-                return (array_is_list($value) ? '[Array(' : '[Object(').\count($value).')]';
+                return $this->visit($key, $form, $depth, $path, $onDrop, $budget);
+            } finally {
+                foreach ($seen as $object) {
+                    $path->offsetUnset($object);
+                }
             }
-
-            return $this->children($key, $value, $depth, $path, $onDrop);
+        }
+        if ($value instanceof \Stringable) {
+            return $this->visit($key, (string) $value, $depth, $path, $onDrop, $budget);
         }
 
-        return null;
+        $vars = get_object_vars($value);
+        if ($depth >= $this->maxDepth) {
+            if ($onDrop !== null) {
+                $onDrop($key, 'depth');
+            }
+
+            return '[Object('.\count($vars).')]';
+        }
+        $path->offsetSet($value, null);
+        try {
+            return $this->children($key, $vars, $depth, $path, $onDrop, $budget);
+        } finally {
+            $path->offsetUnset($value);
+        }
     }
 
     /**
@@ -158,13 +203,20 @@ final class Normalizer
      *
      * @return array<array-key, mixed>
      */
-    private function children(string $key, array $values, int $depth, \SplObjectStorage $path, ?callable $onDrop): array
+    private function children(string $key, array $values, int $depth, \SplObjectStorage $path, ?callable $onDrop, int &$budget): array
     {
         $list = array_is_list($values);
         $out = [];
         foreach ($values as $childKey => $child) {
+            if (--$budget < 0) {
+                // Out of nodes: the rest of this container is left out, and said so.
+                if ($onDrop !== null) {
+                    $onDrop($key, 'truncated');
+                }
+                break;
+            }
             $label = $list ? $key.'['.$childKey.']' : (string) $childKey;
-            $out[$childKey] = $this->visit($label, $child, $depth + 1, $path, $onDrop);
+            $out[$childKey] = $this->visit($label, $child, $depth + 1, $path, $onDrop, $budget);
         }
 
         return $out;
@@ -239,14 +291,10 @@ final class Normalizer
                 }
                 continue;
             }
-            if ($value === null || \is_array($value) || (\is_object($value) && !$value instanceof \Stringable)) {
+            $text = Input::tagValue($value);
+            if ($text === null) {
                 continue;
             }
-            $text = match (true) {
-                \is_bool($value) => $value ? 'true' : 'false',
-                \is_scalar($value), $value instanceof \Stringable => (string) $value,
-                default => '',
-            };
             $out[Bytes::truncate($key, Limits::MAX_TAG_KEY_BYTES)] = self::isSensitiveKey($key) ? self::REDACTED : Bytes::truncate($text, Limits::MAX_TAG_VALUE_BYTES);
             ++$count;
         }

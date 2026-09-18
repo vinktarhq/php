@@ -96,6 +96,34 @@ final class HandlersTest extends TestCase
         self::assertSame(['a notice'], array_column($crumbs, 'message'));
     }
 
+    public function testAnErrorHandlerRegisteredForOneLevelIsCalledForThatLevelOnly(): void
+    {
+        [$code, $output, $sent] = $this->runScript('narrow-previous');
+        [$baselineCode, $baselineOutput] = $this->runScript('narrow-previous', null, false);
+
+        // Line for line what the script prints with no SDK in it: the handler saw its warning, with
+        // the same arguments, and PHP itself dealt with the deprecation and the notice.
+        self::assertSame($baselineOutput, $output);
+        self::assertSame($baselineCode, $code);
+        self::assertSame(1, substr_count($output, 'previous error handler saw:'));
+        self::assertStringContainsString('previous error handler saw: 512 a warning the application raised at handlers.php:', $output);
+
+        $messages = array_map(static fn (array $error): mixed => self::dig($error, 'exceptions', 0, 'value'), self::errors($sent));
+        self::assertSame(['a warning the application raised', 'after the warnings'], $messages);
+    }
+
+    public function testAnErrorHandlerWhoseLevelsNobodyDeclaredIsLeftAlone(): void
+    {
+        [$code, $output, $sent] = $this->runScript('undeclared-previous');
+        [$baselineCode, $baselineOutput] = $this->runScript('undeclared-previous', null, false);
+
+        self::assertSame($baselineOutput, $output);
+        self::assertSame($baselineCode, $code);
+        // Warnings are the application's handler's alone; everything else is still reported.
+        $messages = array_map(static fn (array $error): mixed => self::dig($error, 'exceptions', 0, 'value'), self::errors($sent));
+        self::assertSame(['after the warnings'], $messages);
+    }
+
     public function testAFatalErrorIsReportedAtShutdownEvenOutOfMemory(): void
     {
         [$code, $output, $sent] = $this->runScript('fatal');

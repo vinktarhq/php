@@ -41,4 +41,13 @@ final class Scrub
 
         return preg_replace(self::PATTERNS, self::FILTERED, $text) ?? $text;
     }
+
+    /**
+     * Scrubbed, then cut to $maxBytes. Scrubbing comes first because a token cut in half is still
+     * most of a token; the generous cut before it is so a message of megabytes costs what a long one does.
+     */
+    public static function capped(string $text, int $maxBytes): string
+    {
+        return Bytes::truncate(self::secrets(Bytes::truncate($text, $maxBytes * 4)), $maxBytes);
+    }
 }
