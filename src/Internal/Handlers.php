@@ -29,6 +29,8 @@ namespace Vinktar\Internal;
  * - **Fatal errors** (out of memory, a timeout, a compile error) are found at shutdown with
  *   `error_get_last()`. A small memory reserve is released first, and an out-of-memory error gets a
  *   little more room, so the report can still be built.
+ * - **A fatal error the process lives through** (an exception escaping a FrankenPHP worker's
+ *   request handler) is reported by the next `flush()`, once, and not again when the worker stops.
  *
  * @internal
  */
@@ -99,6 +101,22 @@ final class Handlers
         self::$previousError = $previous;
         self::$previousLevels = $previousLevels ?? 0;
         self::$errorsInstalled = true;
+    }
+
+    /**
+     * Report a fatal error the process lived through, and clear it, so neither the next flush nor shutdown reports it again.
+     *
+     * @param array{type: int, message: string, file: string, line: int}|null $last what `error_get_last()` returns
+     */
+    public static function reportSurvived(?array $last): void
+    {
+        if ($last === null || ($last['type'] & self::FATAL) === 0) {
+            return;
+        }
+        error_clear_last();
+        // PHP's first line is the title; its stack trace text is not.
+        $trace = strpos($last['message'], "\nStack trace:");
+        self::dispatch('fatal', ['message' => $trace === false ? $last['message'] : substr($last['message'], 0, $trace)] + $last);
     }
 
     private static function onException(\Throwable $error): void

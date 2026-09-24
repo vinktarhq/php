@@ -76,6 +76,14 @@ switch ($mode) {
         $client?->captureMessage('after the warnings');
         break;
 
+    case 'survived':
+        // What a FrankenPHP worker leaves in error_get_last() when an exception escapes a request; no CLI process can.
+        $survived = ['type' => E_ERROR, 'message' => "Uncaught RuntimeException: escaped the request in /app/worker.php:12\nStack trace:\n#0 {main}\n  thrown", 'file' => '/app/worker.php', 'line' => 12];
+        Vinktar\Internal\Handlers::reportSurvived($survived);
+        $client?->flush();
+        echo "continued\n";
+        break;
+
     case 'fatal':
         ini_set('memory_limit', '16M');
         $hog = [];
