@@ -12,7 +12,7 @@ namespace Vinktar;
  */
 final class Version
 {
-    public const VERSION = '0.2.0-beta.1';
+    public const VERSION = '0.2.0-beta.2';
 
     public const LIB = 'vinktar-php';
 }

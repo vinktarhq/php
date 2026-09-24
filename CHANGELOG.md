@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0-beta.2
 
 FrankenPHP worker mode is supported, plain, under Laravel Octane and under Symfony's runtime. The
 README's "Worker mode" section has the setup. `WorkerModeTest` serves requests with different
