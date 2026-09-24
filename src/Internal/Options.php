@@ -280,8 +280,9 @@ final class Options
             inert: $inert,
         );
 
+        // Switched off on purpose is a decision, not a problem: only debug output mentions it.
         if ($inert !== null && !$keyless) {
-            $logger->warn("inert: {$inert}");
+            $logger->debug("inert: {$inert}");
         }
 
         return $resolved;

@@ -83,6 +83,17 @@ final class ClientTest extends TestCase
         self::assertSame(['big', 'small'], array_column($transport->records('/v1/batch', 'batch'), 'name'));
     }
 
+    public function testADisabledClientSaysNothing(): void
+    {
+        $lines = [];
+        $disabled = new Client(['enabled' => false, 'logger' => static function (string $level, string $message) use (&$lines): void {
+            $lines[] = "{$level}: {$message}";
+        }]);
+        $disabled->track('ignored');
+        self::assertTrue($disabled->flush());
+        self::assertSame([], $lines);
+    }
+
     public function testAnEnabledClientWithoutAKeyIsInertAndSaysSoOnce(): void
     {
         $disabled = new Client(['enabled' => false, ...self::quiet()]);
