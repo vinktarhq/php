@@ -8,7 +8,8 @@ served.
 Events and errors from a server carry the user, device and session of the visitor they were
 served for, so a backend error sits next to the browser events that led to it in
 [Vinktar](https://vinktar.com). Every request and every job gets a scope of its own: nothing one
-sets reaches another, in PHP-FPM, in a queue worker that runs for a month, or in Fibers.
+sets reaches another, in PHP-FPM, in a FrankenPHP worker, in a queue worker that runs for a month,
+or in Fibers.
 
 ```php
 $vinktar = new Vinktar\Client(['writeKey' => getenv('VINKTAR_KEY'), 'captureErrors' => true]);
@@ -25,10 +26,10 @@ Not from the constructor, not for an argument of the wrong type under `strict_ty
 value that cannot be serialised. Everything the SDK cannot send is said once, in your logs.
 
 ```sh
-composer require vinktarhq/php:^0.1@beta
+composer require vinktarhq/php:^0.2@beta
 ```
 
-This is a beta: the API can still change before 0.1.0, and the changelog says when it does.
+This is a beta: the API can still change before 0.2.0, and the changelog says when it does.
 
 ---
 
@@ -178,7 +179,158 @@ A repeat of the same error for the same person within five seconds is counted, n
 | CLI scripts | Flushed at shutdown; call `flush()` or `close()` yourself when the result matters. |
 | Queue workers | One long-lived client; each job in `withScope()`; `flush()` after each job. |
 | Fibers (ReactPHP, Amp, Revolt) | Scopes are kept per Fiber. A Fiber starts from the client's root scope, so enter a scope inside it. |
-| Swoole, RoadRunner, FrankenPHP worker mode | Not supported yet. |
+| FrankenPHP worker mode, Laravel Octane on FrankenPHP, Symfony on FrankenPHP | One client per worker; each request in its own scope; `flush()` after the response. See [Worker mode](#worker-mode-frankenphp). |
+| RoadRunner | Not tested. Its workers also serve one request at a time, so the same setup should hold, but nothing here proves it yet. |
+| Swoole, Octane on Swoole | Not supported. Swoole serves requests concurrently in one process, in coroutines, and scopes are kept per Fiber, not per coroutine. |
+
+### Worker mode (FrankenPHP)
+
+A worker boots once and serves request after request, so the client does too. Three things follow:
+build the client before the loop, run each request in a scope of its own, and call `flush()` once
+the response has gone. The SDK never reads `$_SERVER` or headers by itself, so nothing is captured
+at boot and left stale; what the request carries comes from `scopeFromHeaders()`, called inside
+the request.
+
+A plain worker script:
+
+```php
+<?php
+// public/index.php, served by `frankenphp php-server --root public --worker public/index.php`
+require __DIR__.'/../vendor/autoload.php';
+
+$vinktar = new Vinktar\Client(['writeKey' => getenv('VINKTAR_KEY'), 'captureErrors' => true]);
+$app = new App\Kernel();
+
+$handler = static function () use ($vinktar, $app): void {
+    $vinktar->withScope(static function () use ($vinktar, $app): void {
+        $vinktar->scopeFromHeaders($_SERVER);
+        try {
+            $app->handle();
+        } catch (Throwable $e) {
+            $vinktar->captureException($e, ['handled' => false]);
+            http_response_code(500);
+        }
+    });
+};
+
+while (frankenphp_handle_request($handler)) {
+    $vinktar->flush();
+}
+```
+
+Catch inside the scope. An exception that escapes the handler does not end a FrankenPHP worker:
+FrankenPHP turns it into a fatal error for that one response, sent with a 200, serves the next
+request, and PHP's exception handler never sees it. With `captureErrors` the next `flush()` still
+reports it, as a fatal error, but the request's scope is gone by then, so it has no user. A real
+fatal error, running out of memory for one, does end the worker: it is reported with the
+request's user as the worker shuts down, and FrankenPHP starts a new one.
+
+`flush()` after `frankenphp_handle_request()` returns runs after the response has been sent, so it
+adds nothing to the response time. It does hold the worker: until it returns, that worker takes no
+new request. When ingest is slow, a flush waits for it, up to `requestTimeoutMs` for each request
+it sends (errors and events are separate requests); after a failure the SDK backs off, and the
+flushes that follow return at once. Lower `requestTimeoutMs` if a worker should never wait that
+long.
+
+**Laravel Octane.** Build the client once per worker by warming it, start a scope when a request
+arrives, and flush when Octane has sent the response:
+
+```php
+// app/Providers/AppServiceProvider.php, with 'vinktar' => ['key' => env('VINKTAR_KEY')] in config/services.php
+use Illuminate\Support\Facades\Event;
+use Laravel\Octane\Events\RequestReceived;
+use Laravel\Octane\Events\RequestTerminated;
+use Vinktar\Client;
+
+public function register(): void
+{
+    $this->app->singleton(Client::class, fn () => new Client(['writeKey' => config('services.vinktar.key')]));
+}
+
+public function boot(): void
+{
+    Event::listen(RequestReceived::class, function (RequestReceived $event): void {
+        $vinktar = app(Client::class);
+        $vinktar->enterScope();
+        $vinktar->scopeFromHeaders($event->request->headers->all());
+    });
+    Event::listen(RequestTerminated::class, fn () => app(Client::class)->flush());
+}
+```
+
+```php
+// config/octane.php
+'warm' => [...Octane::defaultServicesToWarm(), Vinktar\Client::class],
+```
+
+Laravel catches exceptions before PHP can call a handler, so report them from `bootstrap/app.php`:
+`->withExceptions(fn (Exceptions $exceptions) => $exceptions->report(fn (Throwable $e) => app(Vinktar\Client::class)->captureException($e)))`.
+
+**Symfony.** Symfony's runtime runs a FrankenPHP worker by itself (7.4 and later, or
+`runtime/frankenphp-symfony` before that), and calls `kernel.terminate` after the response has
+gone. One subscriber covers it, and is just as right under PHP-FPM:
+
+```php
+// src/EventSubscriber/VinktarSubscriber.php
+namespace App\EventSubscriber;
+
+use Symfony\Component\EventDispatcher\EventSubscriberInterface;
+use Symfony\Component\HttpKernel\Event\ExceptionEvent;
+use Symfony\Component\HttpKernel\Event\RequestEvent;
+use Symfony\Component\HttpKernel\Exception\HttpExceptionInterface;
+use Symfony\Component\HttpKernel\KernelEvents;
+use Vinktar\Client;
+
+final class VinktarSubscriber implements EventSubscriberInterface
+{
+    public function __construct(private readonly Client $vinktar)
+    {
+    }
+
+    public static function getSubscribedEvents(): array
+    {
+        return [
+            KernelEvents::REQUEST => ['onRequest', 4096],
+            KernelEvents::EXCEPTION => 'onException',
+            KernelEvents::TERMINATE => ['onTerminate', -4096],
+        ];
+    }
+
+    public function onRequest(RequestEvent $event): void
+    {
+        if ($event->isMainRequest()) {
+            $this->vinktar->enterScope();
+            $this->vinktar->scopeFromHeaders($event->getRequest()->headers->all());
+        }
+    }
+
+    public function onException(ExceptionEvent $event): void
+    {
+        if (!$event->getThrowable() instanceof HttpExceptionInterface) {
+            $this->vinktar->captureException($event->getThrowable());
+        }
+    }
+
+    public function onTerminate(): void
+    {
+        $this->vinktar->flush();
+    }
+}
+```
+
+```yaml
+# config/services.yaml, under services:
+Vinktar\Client:
+    arguments: [{ writeKey: '%env(VINKTAR_KEY)%' }]
+```
+
+What lasts for the life of a worker, on purpose: the dedupe window (the same error for the same
+person within five seconds, so two anonymous visitors who hit one bug moments apart are one report
+and a count), `maxEventsPerMinute` and `maxErrorsPerMinute`, which count per worker rather than per
+request, a wait the server asked for, and log lines said once. Nothing about a visitor lasts.
+
+A client made inside the request, rather than once per worker, still sends what it holds when it
+is released at the end of the request, but that happens before the response is sent.
 
 ## Sending, flushing and closing
 
@@ -220,7 +372,7 @@ stops. Every later call gets the same answer.
 | `maxQueueSize` | `1000` | Oldest dropped beyond it, and counted. |
 | `requestTimeoutMs` | `5000` | One deadline for the whole request. |
 | `shutdownTimeout` | `2000` | The bound on `close()`, the shutdown flush, and a send triggered by `flushAt`. |
-| `autoFlush` | `true` | Flush when the process shuts down. |
+| `autoFlush` | `true` | Flush when the process shuts down, or when the client is released before that. |
 | `gzip` | `true` | Bodies over 1 KiB, when `ext-zlib` is loaded. |
 | `captureErrors` | `false` | Install the error handlers. |
 | `previousHandlerLevels` | | The levels your own error handler was registered for (`E_ALL` for most frameworks). See [Errors](#errors). |

@@ -140,6 +140,19 @@ final class HandlersTest extends TestCase
         self::assertSame(['type' => 'uncaughtException', 'handled' => false, 'synthetic' => true], $errors[0]['mechanism'] ?? null);
     }
 
+    public function testAFatalErrorTheWorkerLivedThroughIsReportedOnce(): void
+    {
+        [, $output, $sent] = $this->runScript('survived');
+
+        self::assertStringContainsString('continued', $output);
+        $errors = self::errors($sent);
+        self::assertCount(1, $errors);
+        self::assertSame('E_ERROR', self::dig($errors[0], 'exceptions', 0, 'type'));
+        self::assertSame('Uncaught RuntimeException: escaped the request in /app/worker.php:12', self::dig($errors[0], 'exceptions', 0, 'value'));
+        self::assertSame('fatal', $errors[0]['level'] ?? null);
+        self::assertSame(['type' => 'uncaughtException', 'handled' => false, 'synthetic' => true], $errors[0]['mechanism'] ?? null);
+    }
+
     /**
      * @return array{0: int, 1: string, 2: list<array<string, mixed>>}
      */

@@ -77,6 +77,7 @@ final class Client
     private bool $closed = false;
     private ?bool $closeResult = null;
     private bool $handlersInstalled = false;
+    private bool $shutdownFlushed = false;
 
     /**
      * Never throws. With no write key (and `enabled` not false) the client logs one error and is inert.
@@ -647,6 +648,15 @@ final class Client
 
     // Lifecycle -------------------------------------------------------------------------------------
 
+    /** A client dropped while the process goes on, like one made per request in a worker, sends what it holds. */
+    public function __destruct()
+    {
+        if (!$this->o->autoFlush || $this->shutdownFlushed) {
+            return;
+        }
+        $this->guarded(fn () => $this->flushBeforeEnd('the client was released'));
+    }
+
     /**
      * Send what is queued. True only when everything queued when the call started was accepted by the
      * server; false while any of it is held, retrying, or was refused. Safe to call again later.
@@ -659,6 +669,9 @@ final class Client
             }
             if ($this->closed) {
                 return $this->closeResult ?? false;
+            }
+            if ($this->handlersInstalled) {
+                Handlers::reportSurvived(error_get_last());
             }
 
             return $this->dispatcher->flush();
@@ -745,13 +758,19 @@ final class Client
 
     private function flushAtShutdown(): void
     {
+        $this->shutdownFlushed = true;
+        $this->flushBeforeEnd('the process ended');
+    }
+
+    private function flushBeforeEnd(string $when): void
+    {
         if ($this->closed || $this->o->inert !== null) {
             return;
         }
         $this->dispatcher->flush($this->deadline());
         $left = $this->dispatcher->pending();
         if ($left > 0) {
-            $this->logger->warn("{$left} record(s) were not delivered before the process ended");
+            $this->logger->warn("{$left} record(s) were not delivered before {$when}");
         }
     }
 

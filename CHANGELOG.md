@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+FrankenPHP worker mode is supported, plain, under Laravel Octane and under Symfony's runtime. The
+README's "Worker mode" section has the setup. `WorkerModeTest` serves requests with different
+`$_SERVER` values through one client.
+
+- With `captureErrors`, an exception that escapes a FrankenPHP worker's handler is reported by the
+  next `flush()`. FrankenPHP turns it into a fatal error without calling the exception handler and
+  keeps the worker running, so it went unreported until the worker stopped, and was then reported
+  late, with whatever scope was current.
+- A client released while the process goes on sends what it holds, bounded by `shutdownTimeout`.
+  A client made per request in a worker lost its queue at the end of every request.
+
 ## 0.2.0-beta.1
 
 Nothing the SDK does may break the application it is installed in. These are the places where it
